@@ -6,6 +6,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.util.Range
 import android.util.Size
+import kotlin.math.abs
 
 /** Static facts about a camera, read once from its CameraCharacteristics. */
 data class CameraSpecs(
@@ -15,6 +16,8 @@ data class CameraSpecs(
     val sensorOrientation: Int,
     /** Largest RAW_SENSOR output, or null if the camera lacks the RAW capability. */
     val rawSize: Size?,
+    /** Small processed-stream size; only used so the camera can run auto exposure, focus and white balance. */
+    val meteringSize: Size,
     /** SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_* value: which colour filter sits on each photosite. */
     val cfaArrangement: Int,
     /** Black level of each position in the 2x2 colour filter block, indexed row * 2 + column. */
@@ -30,6 +33,16 @@ data class CameraSpecs(
     val minFrameDurationNs: Long,
 ) {
     val supportsManual: Boolean get() = isoRange != null && exposureRangeNs != null
+
+    /** Colour of each 2x2 position (0 red, 1 green, 2 blue, 3 unfiltered), indexed row * 2 + column. */
+    val cfaColours: List<Int>
+        get() = when (cfaArrangement) {
+            CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB -> listOf(0, 1, 1, 2)
+            CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GRBG -> listOf(1, 0, 2, 1)
+            CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG -> listOf(1, 2, 0, 1)
+            CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_BGGR -> listOf(2, 1, 1, 0)
+            else -> listOf(3, 3, 3, 3)
+        }
 }
 
 /** The first back-facing camera in the id list is the device's primary (main) camera. */
@@ -56,7 +69,8 @@ fun findMainBackCamera(manager: CameraManager): CameraSpecs? {
         hardwareLevel = hardwareLevelName(chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)),
         sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
         rawSize = rawSize,
-        cfaArrangement = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+        meteringSize = chooseMeteringSize(map.getOutputSizes(ImageFormat.PRIVATE), rawSize),
+        cfaArrangement =chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
             ?: CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB,
         blackLevels = List(4) { i -> blackPattern?.getOffsetForIndex(i % 2, i / 2) ?: 0 },
         whiteLevel = chars.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023,
@@ -65,6 +79,16 @@ fun findMainBackCamera(manager: CameraManager): CameraSpecs? {
         minFocusDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f,
         minFrameDurationNs = rawSize?.let { map.getOutputMinFrameDuration(ImageFormat.RAW_SENSOR, it) } ?: 0L,
     )
+}
+
+// Big enough for the camera's statistics, small enough to cost almost nothing
+private const val METERING_TARGET_WIDTH = 640
+
+/** The supported size closest to [METERING_TARGET_WIDTH] wide with the same shape as the RAW frame. */
+private fun chooseMeteringSize(sizes: Array<Size>, rawSize: Size?): Size {
+    val aspect = rawSize?.let { it.width.toFloat() / it.height } ?: (4f / 3f)
+    val sameShape = sizes.filter { abs(it.width.toFloat() / it.height - aspect) < 0.01f }
+    return (sameShape.ifEmpty { sizes.toList() }).minBy { abs(it.width - METERING_TARGET_WIDTH) }
 }
 
 private fun hardwareLevelName(level: Int?): String = when (level) {

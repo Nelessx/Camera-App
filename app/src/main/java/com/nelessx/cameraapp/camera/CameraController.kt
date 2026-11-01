@@ -61,6 +61,8 @@ private const val STATS_INTERVAL_NS = 100_000_000L
 // Results are kept briefly so a captured frame can be matched with its metadata, whichever arrives first
 private const val RECENT_RESULTS = 8
 
+private const val HISTOGRAM_INTERVAL_NS = 200_000_000L
+
 /**
  * Owns one Camera2 device streaming nothing but full-size RAW frames. Every frame goes to the
  * viewfinder through [viewfinder]; a capture saves the next frame as a DNG.
@@ -88,10 +90,13 @@ class CameraController(
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var rawReader: ImageReader? = null
+    private var meteringReader: ImageReader? = null
 
     // Bumped on every open/close so callbacks belonging to an earlier open() are ignored
     private var generation = 0
     private var lastStatsTimeNs = 0L
+    private var lastHistogramTimeNs = 0L
+    private val cfa = specs.cfaColours.toIntArray()
     private val recentResults = ArrayDeque<TotalCaptureResult>()
 
     @Volatile
@@ -111,6 +116,9 @@ class CameraController(
 
     private val _stats = MutableStateFlow<FrameStats?>(null)
     val stats: StateFlow<FrameStats?> = _stats.asStateFlow()
+
+    private val _histogram = MutableStateFlow<RawHistogram?>(null)
+    val histogram: StateFlow<RawHistogram?> = _histogram.asStateFlow()
 
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
@@ -209,6 +217,14 @@ class CameraController(
             setOnImageAvailableListener({ onRawImage(it) }, handler)
         }
         rawReader = reader
+        // This phone's camera only runs auto exposure, focus and white balance while a processed stream
+        // is active. This small one exists just for that: its frames are discarded, never shown or saved.
+        val metering = ImageReader.newInstance(
+            specs.meteringSize.width, specs.meteringSize.height, ImageFormat.PRIVATE, 2,
+        ).apply {
+            setOnImageAvailableListener({ it.acquireLatestImage()?.close() }, handler)
+        }
+        meteringReader = metering
 
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(configured: CameraCaptureSession) {
@@ -224,8 +240,8 @@ class CameraController(
                 if (gen == generation) _error.value = "Could not configure camera session"
             }
         }
-        // RAW is the only output: no ISP-processed stream exists, so nothing processed reaches the screen
-        val outputs = listOf(OutputConfiguration(reader.surface))
+        // The viewfinder and DNGs come only from the RAW stream; nothing processed reaches the screen
+        val outputs = listOf(OutputConfiguration(reader.surface), OutputConfiguration(metering.surface))
         try {
             camera.createCaptureSession(
                 SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, executor, callback)
@@ -239,9 +255,11 @@ class CameraController(
     private fun startRepeating() {
         val activeSession = session ?: return
         val reader = rawReader ?: return
+        val metering = meteringReader ?: return
         try {
             val request = activeSession.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(reader.surface)
+                addTarget(metering.surface)
                 applySettings(settings)
             }.build()
             activeSession.setRepeatingRequest(request, frameCallback, handler)
@@ -352,6 +370,11 @@ class CameraController(
             }
             viewfinder.obtain()?.let { buffer ->
                 image.copyRawTo(buffer)
+                val now = SystemClock.elapsedRealtimeNanos()
+                if (now - lastHistogramTimeNs >= HISTOGRAM_INTERVAL_NS) {
+                    lastHistogramTimeNs = now
+                    _histogram.value = rawHistogram(buffer, rawSize.width, rawSize.height, cfa, specs.whiteLevel)
+                }
                 viewfinder.publish(buffer)
             }
         } finally {
@@ -413,8 +436,11 @@ class CameraController(
         device = null
         rawReader?.close()
         rawReader = null
+        meteringReader?.close()
+        meteringReader = null
         recentResults.clear()
         _stats.value = null
+        _histogram.value = null
         // A capture whose frame never reached the saver can't complete any more
         if (capturing && !saving) failCapture("Capture interrupted")
         pendingFrame = null

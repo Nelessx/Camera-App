@@ -7,6 +7,7 @@ import android.opengl.GLSurfaceView
 import android.view.OrientationEventListener
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -26,6 +27,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -45,7 +47,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
@@ -65,6 +70,8 @@ import com.nelessx.cameraapp.camera.CameraSpecs
 import com.nelessx.cameraapp.camera.CaptureSettings
 import com.nelessx.cameraapp.camera.CaptureState
 import com.nelessx.cameraapp.camera.FrameStats
+import com.nelessx.cameraapp.camera.HISTOGRAM_BINS
+import com.nelessx.cameraapp.camera.RawHistogram
 import com.nelessx.cameraapp.camera.findMainBackCamera
 import com.nelessx.cameraapp.viewfinder.FrameMailbox
 import com.nelessx.cameraapp.viewfinder.RawViewfinderRenderer
@@ -75,8 +82,11 @@ import kotlin.math.ln
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+import kotlin.math.sqrt
 
 private val ErrorRed = Color(0xFFFF6B6B)
+private val ClipMagenta = Color(0xFFFF4FFF)
+private val ChannelColours = listOf(Color(0xFFFF5252), Color(0xFF4CE07A), Color(0xFF4C8DFF))
 
 @Composable
 fun CameraScreen() {
@@ -166,12 +176,14 @@ private fun RawCamera() {
     }
 
     val stats by controller.stats.collectAsState()
+    val histogram by controller.histogram.collectAsState()
     val error by controller.error.collectAsState()
     val captureState by controller.captureState.collectAsState()
     var settings by remember { mutableStateOf(CaptureSettings()) }
     var mosaic by remember { mutableStateOf(false) }
     var gamma by remember { mutableStateOf(true) }
     var whiteBalance by remember { mutableStateOf(false) }
+    var clipWarning by remember { mutableStateOf(true) }
     var zoom by remember { mutableFloatStateOf(1f) }
     var centerX by remember { mutableFloatStateOf(0.5f) }
     var centerY by remember { mutableFloatStateOf(0.5f) }
@@ -191,6 +203,7 @@ private fun RawCamera() {
     val viewParams = ViewParams(
         mosaic = mosaic,
         gamma = gamma,
+        clipWarning = clipWarning,
         gainR = if (whiteBalance) stats?.gainR ?: 1f else 1f,
         gainG = if (whiteBalance) stats?.gainG ?: 1f else 1f,
         gainB = if (whiteBalance) stats?.gainB ?: 1f else 1f,
@@ -262,6 +275,17 @@ private fun RawCamera() {
                 modifier = Modifier.align(Alignment.TopStart),
             )
             OverlayText(text = liveSummary(stats), modifier = Modifier.align(Alignment.BottomStart))
+            // Viewing only: these change how sensor values are drawn, never the saved DNG
+            Column(
+                modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalAlignment = Alignment.End,
+            ) {
+                ViewToggle("MOSAIC", mosaic) { mosaic = it }
+                ViewToggle("GAMMA", gamma) { gamma = it }
+                ViewToggle("WB", whiteBalance) { whiteBalance = it }
+                ViewToggle("CLIP", clipWarning) { clipWarning = it }
+            }
         }
 
         Column(
@@ -276,11 +300,12 @@ private fun RawCamera() {
                 ChipToggle("Manual", selected = settings.manual, enabled = specs.supportsManual) {
                     update(switchMode(settings, true, stats, specs))
                 }
-                Box(modifier = Modifier.padding(horizontal = 4.dp).width(1.dp).height(24.dp).background(Color.DarkGray))
-                // Viewing only: these change how sensor values are drawn, never the saved DNG
-                ChipToggle("Mosaic", selected = mosaic) { mosaic = !mosaic }
-                ChipToggle("Gamma", selected = gamma) { gamma = !gamma }
-                ChipToggle("WB", selected = whiteBalance) { whiteBalance = !whiteBalance }
+                RawHistogramView(
+                    histogram = histogram,
+                    blackLevel = specs.blackLevels.average().toFloat(),
+                    whiteLevel = specs.whiteLevel,
+                    modifier = Modifier.weight(1f).padding(start = 4.dp),
+                )
             }
             if (specs.supportsManual) {
                 ManualControls(specs, settings, stats, onChange = ::update)
@@ -298,6 +323,74 @@ private fun RawCamera() {
             StatusLine(captureState, error)
         }
     }
+}
+
+/**
+ * Raw value distribution per colour channel on a linear 0..whiteLevel axis, counts on a square-root
+ * scale so smaller populations stay visible next to the dark peak. The grey line marks the black level.
+ */
+@Composable
+private fun RawHistogramView(histogram: RawHistogram?, blackLevel: Float, whiteLevel: Int, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .height(48.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(Color(0xFF111111)),
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val blackX = blackLevel / (whiteLevel + 1) * size.width
+            drawLine(Color.DarkGray, Offset(blackX, 0f), Offset(blackX, size.height), strokeWidth = 1.dp.toPx())
+            if (histogram == null) return@Canvas
+            val peak = histogram.bins.maxOf { it.max() }.toFloat()
+            if (peak <= 0f) return@Canvas
+            val binWidth = size.width / HISTOGRAM_BINS
+            histogram.bins.forEachIndexed { channel, counts ->
+                val outline = Path().apply {
+                    moveTo(0f, size.height)
+                    counts.forEachIndexed { i, count ->
+                        val top = size.height * (1f - sqrt(count / peak))
+                        lineTo(i * binWidth, top)
+                        lineTo((i + 1) * binWidth, top)
+                    }
+                    lineTo(size.width, size.height)
+                }
+                drawPath(outline, ChannelColours[channel], alpha = 0.25f)
+                drawPath(outline, ChannelColours[channel], style = Stroke(width = 1.5.dp.toPx()))
+            }
+        }
+        val clippedText = histogram?.clipped
+            ?.mapIndexedNotNull { channel, fraction ->
+                if (fraction > 0f) "${"RGB"[channel]} ${formatPercent(fraction)}" else null
+            }
+            ?.joinToString(" ")
+        Text(
+            text = when {
+                histogram == null -> ""
+                clippedText.isNullOrEmpty() -> "no clipping"
+                else -> "clip $clippedText"
+            },
+            color = if (clippedText.isNullOrEmpty()) Color.Gray else ClipMagenta,
+            fontSize = 10.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.align(Alignment.TopEnd).padding(horizontal = 4.dp, vertical = 2.dp),
+        )
+    }
+}
+
+/** Small on/off switch drawn over the viewfinder. */
+@Composable
+private fun ViewToggle(label: String, on: Boolean, onChange: (Boolean) -> Unit) {
+    Text(
+        label,
+        color = if (on) Color.Black else Color.White,
+        fontSize = 11.sp,
+        fontFamily = FontFamily.Monospace,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (on) Color.White else Color(0x99000000))
+            .toggleable(value = on, role = Role.Switch, onValueChange = onChange)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    )
 }
 
 @Composable
@@ -492,6 +585,9 @@ private fun formatShutter(exposureNs: Long): String {
         "1/${(1 / seconds).roundToLong()} s"
     }
 }
+
+private fun formatPercent(fraction: Float): String =
+    if (fraction < 0.001f) "<0.1%" else String.format(Locale.US, "%.1f%%", fraction * 100)
 
 private fun formatFps(frameDurationNs: Long): String {
     if (frameDurationNs <= 0) return "–"

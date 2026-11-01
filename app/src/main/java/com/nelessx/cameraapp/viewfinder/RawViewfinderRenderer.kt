@@ -1,6 +1,5 @@
 package com.nelessx.cameraapp.viewfinder
 
-import android.hardware.camera2.CameraMetadata
 import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.os.SystemClock
@@ -14,6 +13,8 @@ data class ViewParams(
     val mosaic: Boolean = false,
     /** Lift linear sensor values with a display gamma; without it most scenes look almost black. */
     val gamma: Boolean = true,
+    /** Paint photosites at the sensor's saturation level magenta: detail there is lost for good. */
+    val clipWarning: Boolean = true,
     /** White balance multipliers; all 1 shows the sensor's native colour response. */
     val gainR: Float = 1f,
     val gainG: Float = 1f,
@@ -43,7 +44,7 @@ class RawViewfinderRenderer(private val mailbox: FrameMailbox, specs: CameraSpec
     private var fpsFrames = 0
 
     private val rotation = specs.sensorOrientation
-    private val cfa = cfaColours(specs.cfaArrangement)
+    private val cfa = specs.cfaColours
     private val black = specs.blackLevels.map { it.toFloat() }
     private val white = specs.whiteLevel.toFloat()
 
@@ -100,6 +101,7 @@ class RawViewfinderRenderer(private val mailbox: FrameMailbox, specs: CameraSpec
         GLES30.glUniform1i(uniforms.getValue("uRotation"), rotation)
         GLES30.glUniform1i(uniforms.getValue("uMosaic"), if (p.mosaic) 1 else 0)
         GLES30.glUniform1i(uniforms.getValue("uGamma"), if (p.gamma) 1 else 0)
+        GLES30.glUniform1i(uniforms.getValue("uClip"), if (p.clipWarning) 1 else 0)
         GLES30.glUniform3f(uniforms.getValue("uGains"), p.gainR, p.gainG, p.gainB)
         GLES30.glUniform1f(uniforms.getValue("uZoom"), p.zoom)
         GLES30.glUniform2f(uniforms.getValue("uCenter"), p.centerX, p.centerY)
@@ -119,17 +121,9 @@ class RawViewfinderRenderer(private val mailbox: FrameMailbox, specs: CameraSpec
 
     private companion object {
         val UNIFORM_NAMES = listOf(
-            "uRaw", "uCfa", "uBlack", "uWhite", "uRotation", "uMosaic", "uGamma", "uGains", "uZoom", "uCenter",
+            "uRaw", "uCfa", "uBlack", "uWhite", "uRotation", "uMosaic", "uGamma", "uClip", "uGains", "uZoom",
+            "uCenter",
         )
-
-        /** Colour of each 2x2 position (0 red, 1 green, 2 blue, 3 unfiltered), indexed row * 2 + column. */
-        fun cfaColours(arrangement: Int): IntArray = when (arrangement) {
-            CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB -> intArrayOf(0, 1, 1, 2)
-            CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GRBG -> intArrayOf(1, 0, 2, 1)
-            CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG -> intArrayOf(1, 2, 0, 1)
-            CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_BGGR -> intArrayOf(2, 1, 1, 0)
-            else -> intArrayOf(3, 3, 3, 3)
-        }
 
         fun buildProgram(vertexSource: String, fragmentSource: String): Int {
             val program = GLES30.glCreateProgram()
@@ -174,6 +168,7 @@ uniform float uWhite;
 uniform int uRotation;
 uniform bool uMosaic;
 uniform bool uGamma;
+uniform bool uClip;
 uniform vec3 uGains;
 uniform float uZoom;
 uniform vec2 uCenter;
@@ -190,6 +185,13 @@ float level(ivec2 p) {
 vec3 colourMask(int c) {
     return c < 3 ? vec3(c == 0, c == 1, c == 2) : vec3(1.0);
 }
+
+// The photosite reached the sensor's maximum value, so its true brightness is unknown
+bool saturated(ivec2 p) {
+    return float(texelFetch(uRaw, p, 0).r) >= uWhite;
+}
+
+const vec4 CLIPPED = vec4(1.0, 0.0, 1.0, 1.0);
 
 void main() {
     vec2 v = uCenter + (vView - 0.5) / uZoom;
@@ -208,15 +210,26 @@ void main() {
 
     vec3 rgb;
     if (uMosaic) {
+        if (uClip && saturated(p)) {
+            outColor = CLIPPED;
+            return;
+        }
         rgb = level(p) * colourMask(uCfa[(p.y & 1) * 2 + (p.x & 1)]);
     } else {
         ivec2 block = p - (p & 1);
         vec3 sum = vec3(0.0);
         vec3 count = vec3(0.0);
+        bool clipped = false;
         for (int i = 0; i < 4; i++) {
+            ivec2 q = block + ivec2(i & 1, i >> 1);
             vec3 mask = colourMask(uCfa[i]);
-            sum += level(block + ivec2(i & 1, i >> 1)) * mask;
+            sum += level(q) * mask;
             count += mask;
+            clipped = clipped || saturated(q);
+        }
+        if (uClip && clipped) {
+            outColor = CLIPPED;
+            return;
         }
         rgb = sum / max(count, vec3(1.0));
     }
