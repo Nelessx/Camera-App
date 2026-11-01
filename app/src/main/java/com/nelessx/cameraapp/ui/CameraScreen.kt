@@ -3,14 +3,15 @@ package com.nelessx.cameraapp.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
+import android.opengl.GLSurfaceView
 import android.view.OrientationEventListener
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -36,6 +38,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -43,6 +46,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -53,12 +57,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.nelessx.cameraapp.camera.CameraController
 import com.nelessx.cameraapp.camera.CameraSpecs
 import com.nelessx.cameraapp.camera.CaptureSettings
 import com.nelessx.cameraapp.camera.CaptureState
 import com.nelessx.cameraapp.camera.FrameStats
 import com.nelessx.cameraapp.camera.findMainBackCamera
+import com.nelessx.cameraapp.viewfinder.FrameMailbox
+import com.nelessx.cameraapp.viewfinder.RawViewfinderRenderer
+import com.nelessx.cameraapp.viewfinder.ViewParams
+import kotlinx.coroutines.delay
 import java.util.Locale
 import kotlin.math.ln
 import kotlin.math.pow
@@ -90,7 +101,7 @@ fun CameraScreen() {
             .background(Color.Black)
     ) {
         if (hasPermission) {
-            CameraPreview()
+            RawCamera()
         } else {
             PermissionRequest(onRequest = { permissionLauncher.launch(Manifest.permission.CAMERA) })
         }
@@ -98,16 +109,48 @@ fun CameraScreen() {
 }
 
 @Composable
-private fun CameraPreview() {
+private fun RawCamera() {
     val context = LocalContext.current
     val specs = remember { findMainBackCamera(context.getSystemService(CameraManager::class.java)) }
-    if (specs == null) {
-        CenteredMessage("No back camera found")
+    val rawSize = specs?.rawSize
+    if (specs == null || rawSize == null) {
+        CenteredMessage(if (specs == null) "No back camera found" else "This camera has no RAW output")
         return
     }
 
-    val controller = remember { CameraController(context, specs) }
+    val mailbox = remember { FrameMailbox(rawSize.width, rawSize.height) }
+    val renderer = remember { RawViewfinderRenderer(mailbox, specs) }
+    val glView = remember {
+        GLSurfaceView(context).apply {
+            setEGLContextClientVersion(3)
+            setRenderer(renderer)
+            renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+            keepScreenOn = true
+        }
+    }
+    val controller = remember { CameraController(context, specs, mailbox) }
+
+    // The camera streams only while the app is in the foreground
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    glView.onResume()
+                    controller.open()
+                }
+                Lifecycle.Event.ON_PAUSE -> {
+                    controller.close()
+                    glView.onPause()
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     DisposableEffect(controller) {
+        mailbox.onFrameAvailable = { glView.requestRender() }
         // The screen is locked to portrait, so the DNG's orientation comes from how the phone is physically held
         val orientationListener = object : OrientationEventListener(context) {
             override fun onOrientationChanged(orientation: Int) {
@@ -117,45 +160,105 @@ private fun CameraPreview() {
         orientationListener.enable()
         onDispose {
             orientationListener.disable()
+            mailbox.onFrameAvailable = null
             controller.release()
         }
     }
+
     val stats by controller.stats.collectAsState()
     val error by controller.error.collectAsState()
     val captureState by controller.captureState.collectAsState()
     var settings by remember { mutableStateOf(CaptureSettings()) }
+    var mosaic by remember { mutableStateOf(false) }
+    var gamma by remember { mutableStateOf(true) }
+    var whiteBalance by remember { mutableStateOf(false) }
+    var zoom by remember { mutableFloatStateOf(1f) }
+    var centerX by remember { mutableFloatStateOf(0.5f) }
+    var centerY by remember { mutableFloatStateOf(0.5f) }
+    var viewFps by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(renderer) {
+        while (true) {
+            delay(500)
+            viewFps = renderer.drawnFps
+        }
+    }
 
     fun update(newSettings: CaptureSettings) {
         settings = newSettings
         controller.updateSettings(newSettings)
     }
 
+    val viewParams = ViewParams(
+        mosaic = mosaic,
+        gamma = gamma,
+        gainR = if (whiteBalance) stats?.gainR ?: 1f else 1f,
+        gainG = if (whiteBalance) stats?.gainG ?: 1f else 1f,
+        gainB = if (whiteBalance) stats?.gainB ?: 1f else 1f,
+        zoom = zoom,
+        centerX = centerX,
+        centerY = centerY,
+    )
+    // Photosites across the view's width: the portrait screen shows the sensor's short side across
+    val sensorAcross = if (specs.sensorOrientation % 180 == 90) rawSize.height else rawSize.width
+
     Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
         Box(
-            // The app is portrait and the sensor is landscape, so the frame is shown rotated: width and height swap
+            // The sensor is landscape and the app portrait, so the frame is shown rotated: width and height swap
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(specs.previewSize.height.toFloat() / specs.previewSize.width),
+                .aspectRatio(
+                    if (specs.sensorOrientation % 180 == 90) rawSize.height.toFloat() / rawSize.width
+                    else rawSize.width.toFloat() / rawSize.height
+                ),
         ) {
             AndroidView(
-                factory = { ctx ->
-                    SurfaceView(ctx).apply {
-                        keepScreenOn = true
-                        // Must be a size the camera supports, set before the surface is created
-                        holder.setFixedSize(specs.previewSize.width, specs.previewSize.height)
-                        // The surface only exists while the app is visible, so it drives the camera's lifetime
-                        holder.addCallback(object : SurfaceHolder.Callback {
-                            override fun surfaceCreated(holder: SurfaceHolder) = controller.open(holder.surface)
-                            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
-                            override fun surfaceDestroyed(holder: SurfaceHolder) = controller.close()
-                        })
-                    }
+                factory = { glView },
+                update = { view ->
+                    renderer.params = viewParams
+                    view.requestRender()
                 },
                 modifier = Modifier.fillMaxSize(),
             )
+            // Gestures: pinch to zoom, drag to pan, double-tap to toggle 1 photosite = 1 screen pixel
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) {
+                        detectTransformGestures { centroid, pan, gestureZoom, _ ->
+                            val w = size.width.toFloat()
+                            val h = size.height.toFloat()
+                            val maxZoom = 4f * sensorAcross / w
+                            val newZoom = (zoom * gestureZoom).coerceIn(1f, maxZoom)
+                            // Keep the point under the fingers in place while zooming, then follow the drag
+                            val fx = centerX + (centroid.x / w - 0.5f) / zoom
+                            val fy = centerY + (centroid.y / h - 0.5f) / zoom
+                            centerX = clampCenter(fx - (centroid.x / w - 0.5f) / newZoom - pan.x / w / newZoom, newZoom)
+                            centerY = clampCenter(fy - (centroid.y / h - 0.5f) / newZoom - pan.y / h / newZoom, newZoom)
+                            zoom = newZoom
+                        }
+                    }
+                    .pointerInput(Unit) {
+                        detectTapGestures(onDoubleTap = { tap ->
+                            if (zoom > 1.01f) {
+                                zoom = 1f
+                                centerX = 0.5f
+                                centerY = 0.5f
+                            } else {
+                                val oneToOne = sensorAcross / size.width.toFloat()
+                                zoom = oneToOne
+                                centerX = clampCenter(tap.x / size.width, oneToOne)
+                                centerY = clampCenter(tap.y / size.height, oneToOne)
+                            }
+                        })
+                    },
+            )
             OverlayText(
-                text = "CAM ${specs.id} · ${specs.hardwareLevel} · RAW " +
-                    (specs.rawSize?.let { "${it.width}×${it.height}" } ?: "n/a"),
+                text = "CAM ${specs.id} · RAW ${rawSize.width}×${rawSize.height} · view ${viewFps.roundToInt()} fps" +
+                    if (zoom > 1.01f) {
+                        String.format(Locale.US, " · 1 photosite = %.1f px", zoom * glView.width / sensorAcross)
+                    } else {
+                        ""
+                    },
                 modifier = Modifier.align(Alignment.TopStart),
             )
             OverlayText(text = liveSummary(stats), modifier = Modifier.align(Alignment.BottomStart))
@@ -165,29 +268,49 @@ private fun CameraPreview() {
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .navigationBarsPadding()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+                .padding(horizontal = 16.dp),
         ) {
-            ModeSelector(
-                manual = settings.manual,
-                manualAvailable = specs.supportsManual,
-                onChange = { manual -> update(switchMode(settings, manual, stats, specs)) },
-            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                ChipToggle("Auto", selected = !settings.manual) { update(switchMode(settings, false, stats, specs)) }
+                ChipToggle("Manual", selected = settings.manual, enabled = specs.supportsManual) {
+                    update(switchMode(settings, true, stats, specs))
+                }
+                Box(modifier = Modifier.padding(horizontal = 4.dp).width(1.dp).height(24.dp).background(Color.DarkGray))
+                // Viewing only: these change how sensor values are drawn, never the saved DNG
+                ChipToggle("Mosaic", selected = mosaic) { mosaic = !mosaic }
+                ChipToggle("Gamma", selected = gamma) { gamma = !gamma }
+                ChipToggle("WB", selected = whiteBalance) { whiteBalance = !whiteBalance }
+            }
             if (specs.supportsManual) {
                 ManualControls(specs, settings, stats, onChange = ::update)
             }
-            Box(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), contentAlignment = Alignment.Center) {
-                ShutterButton(
-                    enabled = specs.rawSize != null && captureState != CaptureState.Capturing,
-                    onClick = controller::capture,
-                )
-            }
-            StatusLine(specs, captureState, error)
+        }
+        // Pinned below the scrolling controls so the shutter is always reachable
+        Column(
+            modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            ShutterButton(
+                enabled = captureState != CaptureState.Capturing,
+                onClick = controller::capture,
+            )
+            StatusLine(captureState, error)
         }
     }
 }
+
+@Composable
+private fun ChipToggle(label: String, selected: Boolean, enabled: Boolean = true, onClick: () -> Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { Text(label, fontSize = 13.sp) },
+        enabled = enabled,
+    )
+}
+
+private fun clampCenter(value: Float, zoom: Float): Float = value.coerceIn(0.5f / zoom, 1f - 0.5f / zoom)
 
 /** Switching to manual starts from whatever auto-exposure last chose, so the image doesn't jump. */
 private fun switchMode(current: CaptureSettings, manual: Boolean, stats: FrameStats?, specs: CameraSpecs): CaptureSettings {
@@ -200,19 +323,6 @@ private fun switchMode(current: CaptureSettings, manual: Boolean, stats: FrameSt
         exposureNs = exposureRange.clamp(stats.exposureNs),
         focusDiopters = stats.focusDiopters.coerceIn(0f, specs.minFocusDiopters),
     )
-}
-
-@Composable
-private fun ModeSelector(manual: Boolean, manualAvailable: Boolean, onChange: (Boolean) -> Unit) {
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        FilterChip(selected = !manual, onClick = { onChange(false) }, label = { Text("Auto") })
-        FilterChip(
-            selected = manual,
-            onClick = { onChange(true) },
-            label = { Text("Manual") },
-            enabled = manualAvailable,
-        )
-    }
 }
 
 /** In auto mode the sliders are disabled and follow what the camera chose; in manual mode they drive it. */
@@ -297,10 +407,9 @@ private fun ShutterButton(enabled: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun StatusLine(specs: CameraSpecs, captureState: CaptureState, error: String?) {
+private fun StatusLine(captureState: CaptureState, error: String?) {
     val (text, color) = when {
         error != null -> error to ErrorRed
-        specs.rawSize == null -> "This camera has no RAW output" to ErrorRed
         captureState is CaptureState.Capturing -> "Saving DNG…" to Color.White
         captureState is CaptureState.Saved -> "Saved ${captureState.location}" to Color.White
         captureState is CaptureState.Failed -> captureState.message to ErrorRed

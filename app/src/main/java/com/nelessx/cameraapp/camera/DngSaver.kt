@@ -24,13 +24,21 @@ import java.util.Locale
 /** RAW16 pixels copied out of a camera Image, with no row padding, so the Image can be closed right away. */
 class RawFrame(val pixels: ByteBuffer, val size: Size, val timestampNs: Long)
 
-/** Copies a RAW_SENSOR image (16 bits per pixel) into a tightly packed buffer, as DngCreator.writeByteBuffer needs. */
+/** Copies a RAW_SENSOR image into a new tightly packed buffer, as DngCreator.writeByteBuffer needs. */
 fun Image.toRawFrame(): RawFrame {
+    val dst = ByteBuffer.allocateDirect(width * height * 2).order(ByteOrder.nativeOrder())
+    copyRawTo(dst)
+    return RawFrame(dst, Size(width, height), timestamp)
+}
+
+/** Copies a RAW_SENSOR image (16 bits per photosite) into [dst], dropping any row padding. */
+fun Image.copyRawTo(dst: ByteBuffer) {
     val plane = planes[0]
     val rowBytes = width * 2
     val src = plane.buffer
-    val dst = ByteBuffer.allocateDirect(rowBytes * height).order(ByteOrder.nativeOrder())
+    dst.clear()
     if (plane.rowStride == rowBytes) {
+        src.limit(rowBytes * height)
         dst.put(src)
     } else {
         // Skip the padding the camera adds at the end of each row
@@ -42,7 +50,6 @@ fun Image.toRawFrame(): RawFrame {
         }
     }
     dst.rewind()
-    return RawFrame(dst, Size(width, height), timestamp)
 }
 
 private const val ALBUM = "CameraApp"
@@ -69,7 +76,9 @@ class DngSaver(context: Context) {
         DngCreator(characteristics, result).use { dng ->
             dng.setOrientation(exifOrientation)
             val write: (OutputStream) -> Unit = { out ->
-                BufferedOutputStream(out, 1 shl 20).use { dng.writeByteBuffer(it, frame.size, frame.pixels, 0) }
+                BufferedOutputStream(FullFrameDngStream(out, frame.size), 1 shl 20).use {
+                    dng.writeByteBuffer(it, frame.size, frame.pixels, 0)
+                }
             }
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 writeToMediaStore(name, write)

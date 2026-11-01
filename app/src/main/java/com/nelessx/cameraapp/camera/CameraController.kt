@@ -9,7 +9,6 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
-import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
@@ -21,7 +20,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.OrientationEventListener
-import android.view.Surface
+import com.nelessx.cameraapp.viewfinder.FrameMailbox
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,7 +28,7 @@ import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** What the user has chosen; applied to every preview and capture request. */
+/** What the user has chosen; applied to every frame. */
 data class CaptureSettings(
     val manual: Boolean = false,
     val iso: Int = 100,
@@ -43,6 +42,10 @@ data class FrameStats(
     val exposureNs: Long,
     val frameDurationNs: Long,
     val focusDiopters: Float,
+    /** The camera's white balance estimate. Only a hint for viewing and for raw editors. */
+    val gainR: Float,
+    val gainG: Float,
+    val gainB: Float,
 )
 
 sealed interface CaptureState {
@@ -55,17 +58,26 @@ sealed interface CaptureState {
 // The UI only needs a few updates per second, not one per frame
 private const val STATS_INTERVAL_NS = 100_000_000L
 
+// Results are kept briefly so a captured frame can be matched with its metadata, whichever arrives first
+private const val RECENT_RESULTS = 8
+
 /**
- * Owns one Camera2 device: the preview stream, the RAW stream, and DNG capture.
+ * Owns one Camera2 device streaming nothing but full-size RAW frames. Every frame goes to the
+ * viewfinder through [viewfinder]; a capture saves the next frame as a DNG.
  *
  * All camera state lives on a dedicated background thread; the public methods can be called
  * from any thread and just post work to it. DNG files are written on a separate thread so slow
  * storage never stalls camera callbacks.
  */
-class CameraController(context: Context, private val specs: CameraSpecs) {
+class CameraController(
+    context: Context,
+    private val specs: CameraSpecs,
+    private val viewfinder: FrameMailbox,
+) {
 
     private val manager = context.getSystemService(CameraManager::class.java)
     private val characteristics = manager.getCameraCharacteristics(specs.id)
+    private val rawSize = requireNotNull(specs.rawSize) { "Camera ${specs.id} has no RAW output" }
     private val saver = DngSaver(context)
 
     private val thread = HandlerThread("CameraThread").apply { start() }
@@ -75,21 +87,21 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
 
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
-    private var previewSurface: Surface? = null
     private var rawReader: ImageReader? = null
 
     // Bumped on every open/close so callbacks belonging to an earlier open() are ignored
     private var generation = 0
     private var lastStatsTimeNs = 0L
+    private val recentResults = ArrayDeque<TotalCaptureResult>()
 
     @Volatile
     private var settings = CaptureSettings()
     private val settingsUpdateQueued = AtomicBoolean(false)
 
-    // Only one RAW capture is in flight at a time; its image and metadata arrive separately
+    // One capture at a time: the next frame is copied, then saved once its metadata has arrived too
     private var capturing = false
+    private var captureNextFrame = false
     private var saving = false
-    private var pendingResult: TotalCaptureResult? = null
     private var pendingFrame: RawFrame? = null
     private var pendingOrientation = ExifInterface.ORIENTATION_NORMAL
 
@@ -106,14 +118,13 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
     private val _captureState = MutableStateFlow<CaptureState>(CaptureState.Idle)
     val captureState: StateFlow<CaptureState> = _captureState.asStateFlow()
 
-    /** Opens the camera and streams preview frames into [previewSurface]. */
+    /** Opens the camera and starts streaming RAW frames. */
     // Only called once CameraScreen has confirmed the CAMERA permission
     @SuppressLint("MissingPermission")
-    fun open(previewSurface: Surface) {
+    fun open() {
         handler.post {
             closeInternal()
             val gen = generation
-            this.previewSurface = previewSurface
             _error.value = null
             try {
                 manager.openCamera(specs.id, object : CameraDevice.StateCallback() {
@@ -123,7 +134,7 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
                             return
                         }
                         device = camera
-                        startSession(camera, previewSurface, gen)
+                        startSession(camera, gen)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
@@ -150,7 +161,7 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
         }
     }
 
-    /** Applies new settings to the live preview; the next capture uses them too. */
+    /** Applies new settings from the next frame on. */
     fun updateSettings(newSettings: CaptureSettings) {
         settings = newSettings
         // Slider drags fire many updates; only queue one request rebuild at a time
@@ -162,58 +173,19 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
         }
     }
 
-    /** Captures one RAW frame with the current settings and saves it as a DNG. */
+    /** Saves the next RAW frame as a DNG. */
     fun capture() {
         handler.post {
-            val activeSession = session
-            val reader = rawReader
-            if (activeSession == null || reader == null) {
+            if (session == null) {
                 _captureState.value = CaptureState.Failed("Camera not ready")
                 return@post
             }
             if (capturing) return@post
             capturing = true
-            pendingResult = null
+            captureNextFrame = true
             pendingFrame = null
             pendingOrientation = exifOrientation(deviceOrientation)
             _captureState.value = CaptureState.Capturing
-
-            val gen = generation
-            try {
-                // RAW only: this frame has shading correction off, which would flash a seam in the preview
-                val request = activeSession.device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                    addTarget(reader.surface)
-                    applySettings(settings, forRaw = true)
-                    // DngCreator embeds this map so raw editors know the lens's vignetting
-                    set(
-                        CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
-                        CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON,
-                    )
-                }.build()
-                activeSession.capture(request, object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(
-                        session: CameraCaptureSession,
-                        request: CaptureRequest,
-                        result: TotalCaptureResult,
-                    ) {
-                        if (gen != generation) return
-                        pendingResult = result
-                        finishCaptureIfReady()
-                    }
-
-                    override fun onCaptureFailed(
-                        session: CameraCaptureSession,
-                        request: CaptureRequest,
-                        failure: CaptureFailure,
-                    ) {
-                        if (gen == generation) failCapture("Capture failed (reason ${failure.reason})")
-                    }
-                }, handler)
-            } catch (e: CameraAccessException) {
-                failCapture("Capture failed: ${e.message}")
-            } catch (e: IllegalStateException) {
-                failCapture("Camera was closed")
-            }
         }
     }
 
@@ -232,11 +204,9 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
         saveExecutor.shutdown()
     }
 
-    private fun startSession(camera: CameraDevice, surface: Surface, gen: Int) {
-        val reader = specs.rawSize?.let { size ->
-            ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 2).apply {
-                setOnImageAvailableListener({ onRawImage(it) }, handler)
-            }
+    private fun startSession(camera: CameraDevice, gen: Int) {
+        val reader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 4).apply {
+            setOnImageAvailableListener({ onRawImage(it) }, handler)
         }
         rawReader = reader
 
@@ -254,7 +224,8 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
                 if (gen == generation) _error.value = "Could not configure camera session"
             }
         }
-        val outputs = listOfNotNull(OutputConfiguration(surface), reader?.let { OutputConfiguration(it.surface) })
+        // RAW is the only output: no ISP-processed stream exists, so nothing processed reaches the screen
+        val outputs = listOf(OutputConfiguration(reader.surface))
         try {
             camera.createCaptureSession(
                 SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, executor, callback)
@@ -264,31 +235,26 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
         }
     }
 
-    /** (Re)starts the preview with the current settings. Runs on the camera thread. */
+    /** (Re)starts the RAW stream with the current settings. Runs on the camera thread. */
     private fun startRepeating() {
         val activeSession = session ?: return
-        val surface = previewSurface ?: return
+        val reader = rawReader ?: return
         try {
             val request = activeSession.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                addTarget(surface)
-                applySettings(settings, forRaw = false)
+                addTarget(reader.surface)
+                applySettings(settings)
             }.build()
-            activeSession.setRepeatingRequest(request, previewCallback, handler)
+            activeSession.setRepeatingRequest(request, frameCallback, handler)
         } catch (e: CameraAccessException) {
-            _error.value = "Cannot start preview: ${e.message}"
+            _error.value = "Cannot start camera: ${e.message}"
         } catch (e: IllegalStateException) {
             // The session was closed in the meantime; nothing to do
         }
     }
 
-    /**
-     * @param forRaw true for the request that produces the DNG. Shading correction is only switched off
-     * there: with it off, this phone's ISP processes the two frame halves inconsistently and the preview
-     * shows a flickering seam down the middle. RAW pixels are unaffected either way.
-     */
-    private fun CaptureRequest.Builder.applySettings(s: CaptureSettings, forRaw: Boolean) {
-        // Switch off every ISP stage this camera allows. Most only touch processed output (the preview),
-        // but some devices apply hot pixel or shading correction to RAW too.
+    private fun CaptureRequest.Builder.applySettings(s: CaptureSettings) {
+        // Switch off every ISP stage this camera allows. Most only affect processed output, which this
+        // session doesn't have, but some devices apply hot pixel or shading correction to RAW too.
         setOffIfAvailable(
             CaptureRequest.NOISE_REDUCTION_MODE,
             CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES,
@@ -304,13 +270,11 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
             CameraCharacteristics.HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES,
             CameraMetadata.HOT_PIXEL_MODE_OFF,
         )
-        if (forRaw) {
-            setOffIfAvailable(
-                CaptureRequest.SHADING_MODE,
-                CameraCharacteristics.SHADING_AVAILABLE_MODES,
-                CameraMetadata.SHADING_MODE_OFF,
-            )
-        }
+        setOffIfAvailable(
+            CaptureRequest.SHADING_MODE,
+            CameraCharacteristics.SHADING_AVAILABLE_MODES,
+            CameraMetadata.SHADING_MODE_OFF,
+        )
         setOffIfAvailable(
             CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE,
             CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES,
@@ -352,29 +316,44 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
         if (characteristics.get(availableModes)?.contains(off) == true) set(key, off)
     }
 
-    private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
+    private val frameCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
             request: CaptureRequest,
             result: TotalCaptureResult,
         ) {
+            recentResults.addLast(result)
+            if (recentResults.size > RECENT_RESULTS) recentResults.removeFirst()
+            finishCaptureIfReady()
+
             val now = SystemClock.elapsedRealtimeNanos()
             if (now - lastStatsTimeNs < STATS_INTERVAL_NS) return
             lastStatsTimeNs = now
+            val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
             _stats.value = FrameStats(
                 iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0,
                 exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
                 frameDurationNs = result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: 0L,
                 focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f,
+                gainR = gains?.red ?: 1f,
+                gainG = gains?.let { (it.greenEven + it.greenOdd) / 2 } ?: 1f,
+                gainB = gains?.blue ?: 1f,
             )
         }
     }
 
     private fun onRawImage(reader: ImageReader) {
-        val image = reader.acquireNextImage() ?: return
+        // Only the newest frame matters for the viewfinder; older queued ones are dropped
+        val image = reader.acquireLatestImage() ?: return
         try {
-            // Copy now so the reader's buffer is free again; the image itself dies with the session
-            if (capturing && pendingFrame == null) pendingFrame = image.toRawFrame()
+            if (captureNextFrame) {
+                captureNextFrame = false
+                pendingFrame = image.toRawFrame()
+            }
+            viewfinder.obtain()?.let { buffer ->
+                image.copyRawTo(buffer)
+                viewfinder.publish(buffer)
+            }
         } finally {
             image.close()
         }
@@ -382,14 +361,15 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
     }
 
     private fun finishCaptureIfReady() {
-        val result = pendingResult ?: return
         val frame = pendingFrame ?: return
-        pendingResult = null
-        pendingFrame = null
-        if (result.get(CaptureResult.SENSOR_TIMESTAMP) != frame.timestampNs) {
-            failCapture("RAW frame didn't match its metadata")
+        val result = recentResults.firstOrNull { it.get(CaptureResult.SENSOR_TIMESTAMP) == frame.timestampNs }
+        if (result == null) {
+            // Results arrive in frame order: a newer one without a match means this frame's metadata was lost
+            val newest = recentResults.lastOrNull()?.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+            if (newest > frame.timestampNs) failCapture("Frame metadata was lost; try again")
             return
         }
+        pendingFrame = null
         saving = true
         val orientation = pendingOrientation
         saveExecutor.execute {
@@ -408,7 +388,7 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
 
     private fun failCapture(message: String) {
         capturing = false
-        pendingResult = null
+        captureNextFrame = false
         pendingFrame = null
         _captureState.value = CaptureState.Failed(message)
     }
@@ -433,10 +413,10 @@ class CameraController(context: Context, private val specs: CameraSpecs) {
         device = null
         rawReader?.close()
         rawReader = null
+        recentResults.clear()
         _stats.value = null
         // A capture whose frame never reached the saver can't complete any more
         if (capturing && !saving) failCapture("Capture interrupted")
-        pendingResult = null
         pendingFrame = null
     }
 }
