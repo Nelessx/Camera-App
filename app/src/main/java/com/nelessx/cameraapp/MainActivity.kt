@@ -12,7 +12,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            CameraAppTheme {
+            // Always dark: the camera UI sits on black regardless of the system theme
+            CameraAppTheme(darkTheme = true) {
                 CameraScreen()
             }
         }

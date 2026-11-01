@@ -4,6 +4,7 @@ import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.util.Range
 import android.util.Size
 import android.view.SurfaceHolder
 import kotlin.math.abs
@@ -12,10 +13,21 @@ import kotlin.math.abs
 data class CameraSpecs(
     val id: String,
     val hardwareLevel: String,
+    /** Clockwise rotation of the sensor relative to the device's natural (portrait) orientation. */
+    val sensorOrientation: Int,
     /** Largest RAW_SENSOR output, or null if the camera lacks the RAW capability. */
     val rawSize: Size?,
     val previewSize: Size,
-)
+    /** Null when the camera has no MANUAL_SENSOR capability. */
+    val isoRange: Range<Int>?,
+    val exposureRangeNs: Range<Long>?,
+    /** Closest focus in diopters (1/metres); 0 means fixed focus. */
+    val minFocusDiopters: Float,
+    /** Shortest frame duration the preview + RAW streams allow together. */
+    val minFrameDurationNs: Long,
+) {
+    val supportsManual: Boolean get() = isoRange != null && exposureRangeNs != null
+}
 
 // Preview only needs to look sharp on screen; larger sizes waste ISP bandwidth
 private const val MAX_PREVIEW_WIDTH = 1920
@@ -39,12 +51,22 @@ fun findMainBackCamera(manager: CameraManager): CameraSpecs? {
     } else {
         null
     }
+    val previewSize = choosePreviewSize(map.getOutputSizes(SurfaceHolder::class.java), sensorAspect)
+    val manual = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in capabilities
+
+    val previewMinFrame = map.getOutputMinFrameDuration(SurfaceHolder::class.java, previewSize)
+    val rawMinFrame = rawSize?.let { map.getOutputMinFrameDuration(ImageFormat.RAW_SENSOR, it) } ?: 0L
 
     return CameraSpecs(
         id = id,
         hardwareLevel = hardwareLevelName(chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)),
+        sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
         rawSize = rawSize,
-        previewSize = choosePreviewSize(map.getOutputSizes(SurfaceHolder::class.java), sensorAspect),
+        previewSize = previewSize,
+        isoRange = if (manual) chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) else null,
+        exposureRangeNs = if (manual) chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) else null,
+        minFocusDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f,
+        minFrameDurationNs = maxOf(previewMinFrame, rawMinFrame),
     )
 }
 
