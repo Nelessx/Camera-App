@@ -2,6 +2,7 @@ package com.nelessx.cameraapp.camera
 
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
@@ -31,6 +32,21 @@ fun Image.toRawFrame(): RawFrame {
     return RawFrame(dst, Size(width, height), timestamp)
 }
 
+/** Copies the photosites inside [region] of a RAW_SENSOR image into [dst], rows tightly packed. */
+fun Image.copyRegionTo(dst: ByteBuffer, region: Rect) {
+    val plane = planes[0]
+    val rowBytes = region.width() * 2
+    val src = plane.buffer
+    dst.clear()
+    for (row in region.top until region.bottom) {
+        val start = row * plane.rowStride + region.left * 2
+        src.limit(start + rowBytes)
+        src.position(start)
+        dst.put(src)
+    }
+    dst.rewind()
+}
+
 /** Copies a RAW_SENSOR image (16 bits per photosite) into [dst], dropping any row padding. */
 fun Image.copyRawTo(dst: ByteBuffer) {
     val plane = planes[0]
@@ -39,6 +55,8 @@ fun Image.copyRawTo(dst: ByteBuffer) {
     dst.clear()
     if (plane.rowStride == rowBytes) {
         src.limit(rowBytes * height)
+        // An earlier copy of the same image (copyRegionTo) may have left the position elsewhere
+        src.position(0)
         dst.put(src)
     } else {
         // Skip the padding the camera adds at the end of each row

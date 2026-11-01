@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -33,9 +34,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -73,6 +76,8 @@ import com.nelessx.cameraapp.camera.FrameStats
 import com.nelessx.cameraapp.camera.HISTOGRAM_BINS
 import com.nelessx.cameraapp.camera.RawHistogram
 import com.nelessx.cameraapp.camera.findMainBackCamera
+import com.nelessx.cameraapp.video.RecordingStats
+import com.nelessx.cameraapp.video.VideoMode
 import com.nelessx.cameraapp.viewfinder.FrameMailbox
 import com.nelessx.cameraapp.viewfinder.RawViewfinderRenderer
 import com.nelessx.cameraapp.viewfinder.ViewParams
@@ -86,6 +91,7 @@ import kotlin.math.sqrt
 
 private val ErrorRed = Color(0xFFFF6B6B)
 private val ClipMagenta = Color(0xFFFF4FFF)
+private val RecordRed = Color(0xFFE53935)
 private val ChannelColours = listOf(Color(0xFFFF5252), Color(0xFF4CE07A), Color(0xFF4C8DFF))
 
 @Composable
@@ -179,7 +185,20 @@ private fun RawCamera() {
     val histogram by controller.histogram.collectAsState()
     val error by controller.error.collectAsState()
     val captureState by controller.captureState.collectAsState()
+    val recording by controller.recording.collectAsState()
     var settings by remember { mutableStateOf(CaptureSettings()) }
+    var videoFormat by remember { mutableStateOf(VideoMode.WINDOW_1080) }
+    var audioGranted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> audioGranted = granted }
+    val isRecording = recording?.let { !it.stopping && !it.finished } == true
+    val isFinishing = recording?.let { it.stopping && !it.finished } == true
     var mosaic by remember { mutableStateOf(false) }
     var gamma by remember { mutableStateOf(true) }
     var whiteBalance by remember { mutableStateOf(false) }
@@ -198,6 +217,12 @@ private fun RawCamera() {
     fun update(newSettings: CaptureSettings) {
         settings = newSettings
         controller.updateSettings(newSettings)
+    }
+
+    fun setVideo(video: Boolean) {
+        update(settings.copy(video = video))
+        // Sound is optional: without the permission, videos are recorded silent
+        if (video && !audioGranted) audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
 
     val viewParams = ViewParams(
@@ -265,15 +290,36 @@ private fun RawCamera() {
                         })
                     },
             )
-            OverlayText(
-                text = "CAM ${specs.id} · RAW ${rawSize.width}×${rawSize.height} · view ${viewFps.roundToInt()} fps" +
-                    if (zoom > 1.01f) {
-                        String.format(Locale.US, " · 1 photosite = %.1f px", zoom * glView.width / sensorAcross)
-                    } else {
-                        ""
-                    },
-                modifier = Modifier.align(Alignment.TopStart),
-            )
+            // Outline of the area a windowed video records (only meaningful when not zoomed in)
+            if (settings.video && videoFormat != VideoMode.FULL_FRAME && zoom <= 1.01f) {
+                val region = videoFormat.region(rawSize)
+                val rotated = specs.sensorOrientation % 180 == 90
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .fillMaxWidth(if (rotated) region.height().toFloat() / rawSize.height else region.width().toFloat() / rawSize.width)
+                        .fillMaxHeight(if (rotated) region.width().toFloat() / rawSize.width else region.height().toFloat() / rawSize.height)
+                        .border(1.5.dp, Color.White.copy(alpha = 0.8f)),
+                )
+            }
+            val rec = recording
+            if (rec != null && !rec.finished) {
+                OverlayText(
+                    text = recordingSummary(rec),
+                    modifier = Modifier.align(Alignment.TopStart),
+                    background = Color(0xCCD32F2F),
+                )
+            } else {
+                OverlayText(
+                    text = "CAM ${specs.id} · RAW ${rawSize.width}×${rawSize.height} · view ${viewFps.roundToInt()} fps" +
+                        if (zoom > 1.01f) {
+                            String.format(Locale.US, " · 1 photosite = %.1f px", zoom * glView.width / sensorAcross)
+                        } else {
+                            ""
+                        },
+                    modifier = Modifier.align(Alignment.TopStart),
+                )
+            }
             OverlayText(text = liveSummary(stats), modifier = Modifier.align(Alignment.BottomStart))
             // Viewing only: these change how sensor values are drawn, never the saved DNG
             Column(
@@ -316,12 +362,59 @@ private fun RawCamera() {
             modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            ShutterButton(
-                enabled = captureState != CaptureState.Capturing,
-                onClick = controller::capture,
-            )
-            StatusLine(captureState, error)
+            val busy = isRecording || isFinishing
+            // Compact chips: two stacked fit beside the shutter
+            CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 0.dp) {
+                Row(modifier = Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        ChipToggle("Photo", selected = !settings.video, enabled = !busy) { setVideo(false) }
+                        ChipToggle("Video", selected = settings.video, enabled = !busy) { setVideo(true) }
+                    }
+                    ShutterButton(
+                        style = when {
+                            !settings.video -> ShutterStyle.PHOTO
+                            isRecording -> ShutterStyle.RECORDING
+                            else -> ShutterStyle.VIDEO
+                        },
+                        enabled = if (settings.video) !isFinishing else captureState != CaptureState.Capturing,
+                        onClick = {
+                            when {
+                                !settings.video -> controller.capture()
+                                isRecording -> controller.stopRecording()
+                                else -> controller.startRecording(videoFormat, audioGranted)
+                            }
+                        },
+                    )
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        horizontalAlignment = Alignment.End,
+                    ) {
+                        if (settings.video) {
+                            VideoMode.entries.forEach { format ->
+                                ChipToggle(format.label, selected = videoFormat == format, enabled = !busy) {
+                                    videoFormat = format
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            StatusLine(captureState, error, settings.video, if (settings.video) recording else null)
         }
+    }
+}
+
+private fun recordingSummary(stats: RecordingStats): String {
+    val seconds = stats.durationNs / 1_000_000_000L
+    val base = String.format(
+        Locale.US, "● REC %d:%02d · %d frames · %.2f GB",
+        seconds / 60, seconds % 60, stats.frames, stats.bytes / 1e9,
+    )
+    return when {
+        stats.stopping -> "Writing remaining frames · ${stats.frames} done"
+        stats.dropped > 0 -> "$base · ${stats.dropped} dropped"
+        else -> base
     }
 }
 
@@ -485,24 +578,47 @@ private fun ControlSlider(
     }
 }
 
+private enum class ShutterStyle { PHOTO, VIDEO, RECORDING }
+
 @Composable
-private fun ShutterButton(enabled: Boolean, onClick: () -> Unit) {
+private fun ShutterButton(style: ShutterStyle, enabled: Boolean, onClick: () -> Unit) {
+    val recording = style == ShutterStyle.RECORDING
     Box(
         modifier = Modifier
             .size(72.dp)
             .border(4.dp, Color.White, CircleShape)
-            .padding(8.dp)
-            .clip(CircleShape)
-            .background(if (enabled) Color.White else Color.DarkGray)
+            // While recording the button becomes a smaller square: tap to stop
+            .padding(if (recording) 20.dp else 8.dp)
+            .clip(if (recording) RoundedCornerShape(6.dp) else CircleShape)
+            .background(
+                when {
+                    !enabled -> Color.DarkGray
+                    style == ShutterStyle.PHOTO -> Color.White
+                    else -> RecordRed
+                }
+            )
             .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-            .semantics { contentDescription = "Capture RAW photo" },
+            .semantics {
+                contentDescription = when (style) {
+                    ShutterStyle.PHOTO -> "Capture RAW photo"
+                    ShutterStyle.VIDEO -> "Start raw video recording"
+                    ShutterStyle.RECORDING -> "Stop recording"
+                }
+            },
     )
 }
 
 @Composable
-private fun StatusLine(captureState: CaptureState, error: String?) {
+private fun StatusLine(captureState: CaptureState, error: String?, video: Boolean, recording: RecordingStats?) {
     val (text, color) = when {
         error != null -> error to ErrorRed
+        recording?.error != null -> recording.error to ErrorRed
+        recording != null && recording.finished ->
+            "Saved ${recording.frames} frames" +
+                (if (recording.dropped > 0) " (${recording.dropped} dropped)" else "") +
+                " to ${recording.folder}" to Color.White
+        recording != null -> "Recording to ${recording.folder}" to Color.Gray
+        video -> "Videos are saved as DNG sequences in Android/data/…/files/Movies" to Color.Gray
         captureState is CaptureState.Capturing -> "Saving DNG…" to Color.White
         captureState is CaptureState.Saved -> "Saved ${captureState.location}" to Color.White
         captureState is CaptureState.Failed -> captureState.message to ErrorRed
@@ -513,12 +629,12 @@ private fun StatusLine(captureState: CaptureState, error: String?) {
         color = color,
         fontSize = 12.sp,
         textAlign = TextAlign.Center,
-        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, top = 4.dp, end = 16.dp),
     )
 }
 
 @Composable
-private fun OverlayText(text: String, modifier: Modifier = Modifier) {
+private fun OverlayText(text: String, modifier: Modifier = Modifier, background: Color = Color(0x99000000)) {
     Text(
         text,
         color = Color.White,
@@ -526,7 +642,7 @@ private fun OverlayText(text: String, modifier: Modifier = Modifier) {
         fontFamily = FontFamily.Monospace,
         modifier = modifier
             .padding(8.dp)
-            .background(Color(0x99000000), RoundedCornerShape(4.dp))
+            .background(background, RoundedCornerShape(4.dp))
             .padding(horizontal = 6.dp, vertical = 2.dp),
     )
 }

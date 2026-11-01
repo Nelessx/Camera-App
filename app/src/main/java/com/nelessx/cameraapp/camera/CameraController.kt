@@ -3,6 +3,7 @@ package com.nelessx.cameraapp.camera
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.ImageFormat
+import android.graphics.Rect
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -16,14 +17,25 @@ import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ExifInterface
 import android.media.ImageReader
+import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.OrientationEventListener
+import com.nelessx.cameraapp.video.DngStaticMetadata
+import com.nelessx.cameraapp.video.FrameMetadata
+import com.nelessx.cameraapp.video.RawVideoRecorder
+import com.nelessx.cameraapp.video.RecordingStats
+import com.nelessx.cameraapp.video.VideoMode
 import com.nelessx.cameraapp.viewfinder.FrameMailbox
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.File
+import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -34,6 +46,8 @@ data class CaptureSettings(
     val iso: Int = 100,
     val exposureNs: Long = 10_000_000L,
     val focusDiopters: Float = 0f,
+    /** Video mode: auto exposure keeps a fixed frame rate so recordings have even timing. */
+    val video: Boolean = false,
 )
 
 /** Values the sensor actually used for a frame, as reported in its CaptureResult. */
@@ -77,8 +91,13 @@ class CameraController(
     private val viewfinder: FrameMailbox,
 ) {
 
+    private val appContext = context.applicationContext
     private val manager = context.getSystemService(CameraManager::class.java)
     private val characteristics = manager.getCameraCharacteristics(specs.id)
+    // Highest fixed AE frame rate up to 30 fps, so auto exposure never stretches frames in video mode
+    private val fixedFpsRange = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        ?.filter { it.lower == it.upper && it.upper <= 30 }
+        ?.maxByOrNull { it.upper }
     private val rawSize = requireNotNull(specs.rawSize) { "Camera ${specs.id} has no RAW output" }
     private val saver = DngSaver(context)
 
@@ -110,6 +129,14 @@ class CameraController(
     private var pendingFrame: RawFrame? = null
     private var pendingOrientation = ExifInterface.ORIENTATION_NORMAL
 
+    // Raw video: frames are copied on arrival, then handed to the recorder once their metadata arrives
+    private var recorder: RawVideoRecorder? = null
+    private var recordRegion = Rect()
+    private var recordIntervalNs = 0L
+    private var lastRecordedTimestampNs = 0L
+    private val pendingVideoFrames = ArrayDeque<Pair<Long, ByteBuffer>>()
+    private var lastFrameMetadata: FrameMetadata? = null
+
     /** Physical device rotation in degrees, from an OrientationEventListener; tags DNG orientation. */
     @Volatile
     var deviceOrientation = 0
@@ -125,6 +152,10 @@ class CameraController(
 
     private val _captureState = MutableStateFlow<CaptureState>(CaptureState.Idle)
     val captureState: StateFlow<CaptureState> = _captureState.asStateFlow()
+
+    /** The current or most recent recording; null before the first one. */
+    private val _recording = MutableStateFlow<RecordingStats?>(null)
+    val recording: StateFlow<RecordingStats?> = _recording.asStateFlow()
 
     /** Opens the camera and starts streaming RAW frames. */
     // Only called once CameraScreen has confirmed the CAMERA permission
@@ -195,6 +226,50 @@ class CameraController(
             pendingOrientation = exifOrientation(deviceOrientation)
             _captureState.value = CaptureState.Capturing
         }
+    }
+
+    /**
+     * Starts recording raw video into a new folder in the app's own storage (kept out of the gallery,
+     * which would otherwise show every frame as a photo).
+     *
+     * @param withAudio only true once RECORD_AUDIO has been granted
+     */
+    fun startRecording(mode: VideoMode, withAudio: Boolean) {
+        handler.post {
+            if (session == null || recorder != null) return@post
+            val root = appContext.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+            if (root == null) {
+                _error.value = "Storage is not available"
+                return@post
+            }
+            val name = "VID_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val folder = File(root, name).apply { mkdirs() }
+            val timestampSource = when (characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE)) {
+                CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME -> "REALTIME (CLOCK_BOOTTIME, same clock as the audio timestamp)"
+                else -> "UNKNOWN (audio offset is approximate)"
+            }
+            recordRegion = mode.region(rawSize)
+            // A little under one output frame period, so every camera frame qualifies at 30 fps
+            recordIntervalNs = 1_000_000_000L / mode.targetFps - 15_000_000L
+            lastRecordedTimestampNs = 0L
+            recorder = RawVideoRecorder(
+                context = appContext,
+                folder = folder,
+                displayFolder = "Android/data/${appContext.packageName}/files/Movies/$name",
+                mode = mode,
+                region = recordRegion,
+                meta = DngStaticMetadata(characteristics, specs),
+                exifOrientation = exifOrientation(deviceOrientation),
+                recordAudio = withAudio,
+                timestampSource = timestampSource,
+                onStats = { _recording.value = it },
+            )
+        }
+    }
+
+    /** Stops recording; frames already captured are still written. */
+    fun stopRecording() {
+        handler.post { stopRecordingInternal() }
     }
 
     /** Stops streaming and frees the camera so other apps can use it. */
@@ -319,6 +394,7 @@ class CameraController(
             }
         } else {
             set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+            if (s.video) fixedFpsRange?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
             val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
             if (canFocus && CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE in afModes) {
                 set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
@@ -343,6 +419,7 @@ class CameraController(
             recentResults.addLast(result)
             if (recentResults.size > RECENT_RESULTS) recentResults.removeFirst()
             finishCaptureIfReady()
+            submitVideoFrames()
 
             val now = SystemClock.elapsedRealtimeNanos()
             if (now - lastStatsTimeNs < STATS_INTERVAL_NS) return
@@ -368,6 +445,15 @@ class CameraController(
                 captureNextFrame = false
                 pendingFrame = image.toRawFrame()
             }
+            recorder?.let { rec ->
+                if (image.timestamp - lastRecordedTimestampNs >= recordIntervalNs) {
+                    rec.obtainBuffer()?.let { buffer ->
+                        image.copyRegionTo(buffer, recordRegion)
+                        pendingVideoFrames.addLast(image.timestamp to buffer)
+                        lastRecordedTimestampNs = image.timestamp
+                    }
+                }
+            }
             viewfinder.obtain()?.let { buffer ->
                 image.copyRawTo(buffer)
                 val now = SystemClock.elapsedRealtimeNanos()
@@ -381,6 +467,40 @@ class CameraController(
             image.close()
         }
         finishCaptureIfReady()
+        submitVideoFrames()
+    }
+
+    /** Hands recorded frames to the recorder, in order, once each one's metadata has arrived. */
+    private fun submitVideoFrames() {
+        val rec = recorder ?: return
+        while (pendingVideoFrames.isNotEmpty()) {
+            val (timestamp, buffer) = pendingVideoFrames.first()
+            val result = recentResults.firstOrNull { it.get(CaptureResult.SENSOR_TIMESTAMP) == timestamp }
+            val newest = recentResults.lastOrNull()?.get(CaptureResult.SENSOR_TIMESTAMP) ?: Long.MIN_VALUE
+            val metadata = when {
+                result != null -> FrameMetadata.from(result).also { lastFrameMetadata = it }
+                // Results arrive in frame order: a newer one means this frame's was lost
+                newest > timestamp -> fallbackMetadata(timestamp)
+                else -> return
+            }
+            pendingVideoFrames.removeFirst()
+            rec.submit(buffer, metadata)
+        }
+        if (rec.error != null) stopRecordingInternal()
+    }
+
+    private fun fallbackMetadata(timestamp: Long): FrameMetadata =
+        lastFrameMetadata?.copy(timestampNs = timestamp) ?: FrameMetadata(timestamp, 0L, 0, null, 0f, 0f)
+
+    private fun stopRecordingInternal() {
+        val rec = recorder ?: return
+        recorder = null
+        // Frames still waiting for metadata are written with the last known values
+        while (pendingVideoFrames.isNotEmpty()) {
+            val (timestamp, buffer) = pendingVideoFrames.removeFirst()
+            rec.submit(buffer, fallbackMetadata(timestamp))
+        }
+        rec.finish()
     }
 
     private fun finishCaptureIfReady() {
@@ -429,6 +549,7 @@ class CameraController(
     }
 
     private fun closeInternal() {
+        stopRecordingInternal()
         generation++
         session?.close()
         session = null
