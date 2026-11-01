@@ -34,6 +34,12 @@ android {
     buildFeatures {
         compose = true
     }
+    testOptions {
+        unitTests {
+            // Compose Preview tasks need compiled resources; without this, IDE project import fails
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 dependencies {
